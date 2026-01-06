@@ -1,0 +1,79 @@
+// **** 1. 讀取您的行道樹資產 ****
+var trees = ee.FeatureCollection("projects/ee-singler97/assets/taipei_tree_point");
+
+// 設定分析年份
+var year = 2025;
+var startDate = year + '-01-01';
+var endDate = year + '-12-31';
+
+// **** 2. 處理 Landsat 9 影像 (Collection 2 Level 2) ****
+// 定義去雲與轉換溫度的函數
+function preprocessLandsat(image) {
+  // Bitmask for QA_PIXEL (Cloud mask)
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+    .and(qa.bitwiseAnd(1 << 4).eq(0)); // 去除雲和雲影
+
+  // 選擇熱紅外線波段 (ST_B10)
+  var thermal = image.select('ST_B10');
+  
+  // 應用 Scale Factor 與 Offset 轉換為 Kelvin，再轉為攝氏度
+  // Landsat Collection 2 的公式: 0.00341802 * DN + 149.0
+  var kelvin = thermal.multiply(0.00341802).add(149.0);
+  var celsius = kelvin.subtract(273.15).rename('LST_Celsius');
+
+  return image.addBands(celsius)
+              .updateMask(mask)
+              .copyProperties(image, ['system:time_start']);
+}
+
+// 載入 Landsat 9 影像集合
+var l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+  .filterBounds(trees.geometry()) // 只選取涵蓋點位的影像
+  .filterDate(startDate, endDate)
+  .map(preprocessLandsat);
+
+// **** 3. 計算 2025 年的「年度平均」或「年度中位數」溫度 ****
+// 建議使用中位數 (median) 來避免極端值或殘留雲層的影響
+var lst2025 = l9.select('LST_Celsius').median();
+
+// **** 4. 建立 10 公尺緩衝區 (Buffer) ****
+var bufferedTrees = trees.map(function(feature) {
+  return feature.buffer(10); // 半徑 10 公尺
+});
+
+// **** 5. 提取每個點位的溫度數值 (Zonal Statistics) ****
+var treeTemperatures = lst2025.reduceRegions({
+  collection: bufferedTrees,
+  reducer: ee.Reducer.mean(), // 計算 10m 範圍內的平均溫度
+  scale: 30, // Landsat 的解析度
+  crs: 'EPSG:3857' // 投影座標系統，可依需求調整
+});
+
+// **** 6. 視覺化檢查 (可選) ****
+Map.centerObject(trees, 12);
+Map.addLayer(lst2025, {min: 15, max: 35, palette: ['blue', 'yellow', 'red']}, '2025 Median LST (C)');
+Map.addLayer(bufferedTrees, {color: 'green'}, 'Tree Buffers (10m)');
+
+
+
+
+// **** 7. 匯出 TIF 影像 (修正版) ****
+
+// 解決方案：不要用 trees.geometry().bounds()，直接定義一個台北市的方框
+// 這裡使用的是大概涵蓋台北市的座標範圍
+var taipeiBounds = ee.Geometry.Rectangle([121.45, 24.96, 121.67, 25.21]);
+
+Export.image.toDrive({
+  image: lst2025,                  // 要匯出的影像
+  description: 'Taipei_LST_2025',  // 檔名
+  folder: 'GEE_Export',            // Google Drive 資料夾
+  region: taipeiBounds,            // 這是關鍵：強制指定匯出這個方框範圍
+  scale: 30,                       // 解析度
+  crs: 'EPSG:3857',                // 座標系統
+  maxPixels: 1e13                  // 防止像素過多報錯
+});
+
+// **** 除錯檢查 ****
+// 順便檢查一下您的樹木檔案到底讀進來幾棵樹，確保資產沒問題
+print('樹木點位總數量:', trees.size());
